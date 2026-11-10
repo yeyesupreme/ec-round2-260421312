@@ -1,0 +1,15 @@
+build
+mx.scratch
+!.settings
+build/
+Debug/
+Release/
+*.elf
+*.bin
+*.hex
+*.map
+*.o
+*.d
+.mxproject
+.settings
+ec_merge.py
