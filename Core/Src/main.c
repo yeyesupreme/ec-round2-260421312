@@ -44,6 +44,8 @@
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
+static uint32_t s_last_blink;
+static uint8_t  s_led_on;
 
 /* USER CODE END PV */
 
@@ -57,7 +59,6 @@ void SystemClock_Config(void);
 /* USER CODE BEGIN 0 */
 
 /* USER CODE END 0 */
-
 /**
   * @brief  The application entry point.
   * @retval int
@@ -99,6 +100,14 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+    uint32_t now = HAL_GetTick();
+if ((uint32_t)(now - s_last_blink) >= 500u) {
+    s_last_blink = now;
+    s_led_on = (uint8_t)(s_led_on ? 0u : 1u);
+    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13,
+                      s_led_on ? GPIO_PIN_RESET : GPIO_PIN_SET);
+}
+
   }
   /* USER CODE END 3 */
 }
