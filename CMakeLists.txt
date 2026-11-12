@@ -8,7 +8,7 @@ cmake_minimum_required(VERSION 3.22)
 #
 
 # Setup compiler settings
-set(CMAKE_C_STANDARD 11)
+set(CMAKE_C_STANDARD 17)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS ON)
 
@@ -56,6 +56,13 @@ target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
 target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user defined symbols
 )
+
+# 编译警告：任务书 2.2 要求打开 -Wall -Wextra（工具链文件 cmake/gcc-arm-none-eabi.cmake 不得手改，
+# 故警告选项在本文件追加）
+target_compile_options(${CMAKE_PROJECT_NAME} PRIVATE -Wall -Wextra)
+
+# Release 优化级别：任务书要求 -O2（工具链文件默认 -Os，这里覆盖）
+target_compile_options(${CMAKE_PROJECT_NAME} PRIVATE $<$<CONFIG:Release>:-O2>)
 
 # Remove wrong libob.a library dependency when using cpp files
 list(REMOVE_ITEM CMAKE_C_IMPLICIT_LINK_LIBRARIES ob)
