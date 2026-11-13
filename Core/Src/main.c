@@ -70,8 +70,8 @@ typedef struct
 #define LED_PIN             GPIO_PIN_13
 #define LED_OFF()           HAL_GPIO_WritePin(LED_PORT, LED_PIN, GPIO_PIN_SET)
 
-/* 当前接了几路。CubeMX 侧目前只配了 TIM2_CH1，故为 1；扩到四路时改这里并补表项 */
-#define SERVO_COUNT         1U
+/* 当前接了几路舵机。TIM3 四通道全部启用：PA6/PA7/PB0/PB1 */
+#define SERVO_COUNT         4U
 
 /* USER CODE END PD */
 
@@ -83,10 +83,17 @@ typedef struct
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
-/* 舵机表：当前 1 路（TIM2_CH1 → PA15）。明天换 TIM3 四路时，只改这张表 */
+/* 舵机表：四路全部挂在 TIM3，引脚 PA6/PA7/PB0/PB1 对应 CH1~CH4。
+ * 顺序即后续机械臂的关节顺序：Q1 底座、Q2 肩、Q3 肘、Q4 夹爪 */
 static Servo_t g_servos[SERVO_COUNT] =
 {
-  { &htim2, TIM_CHANNEL_1, SERVO_PULSE_MIN_US, SERVO_PULSE_MAX_US,
+  { &htim3, TIM_CHANNEL_1, SERVO_PULSE_MIN_US, SERVO_PULSE_MAX_US,
+    SERVO_PULSE_MID_US, SERVO_PULSE_MID_US },
+  { &htim3, TIM_CHANNEL_2, SERVO_PULSE_MIN_US, SERVO_PULSE_MAX_US,
+    SERVO_PULSE_MID_US, SERVO_PULSE_MID_US },
+  { &htim3, TIM_CHANNEL_3, SERVO_PULSE_MIN_US, SERVO_PULSE_MAX_US,
+    SERVO_PULSE_MID_US, SERVO_PULSE_MID_US },
+  { &htim3, TIM_CHANNEL_4, SERVO_PULSE_MIN_US, SERVO_PULSE_MAX_US,
     SERVO_PULSE_MID_US, SERVO_PULSE_MID_US },
 };
 
@@ -230,6 +237,35 @@ static void Servo_Task(void)
   }
 }
 
+/**
+  * @brief 启动四路 PWM，并统一给中位脉宽
+  * @note  上电顺序很重要：先让四路都输出 1.5ms 再让舵机上电，
+  *        否则舵机可能以未知脉宽上电而瞬间甩到极限位置。
+  */
+static void Servo_InitAll(void)
+{
+  uint8_t i;
+
+  for (i = 0U; i < SERVO_COUNT; i++)
+  {
+    HAL_TIM_PWM_Start(g_servos[i].htim, g_servos[i].channel);
+    Servo_ApplyPulse(&g_servos[i], SERVO_PULSE_MID_US);
+  }
+}
+
+/**
+  * @brief 四路统一设定同一个目标角度（联调前确认通道顺序用）
+  */
+static void Servo_SetAllAngle(float deg)
+{
+  uint8_t i;
+
+  for (i = 0U; i < SERVO_COUNT; i++)
+  {
+    Servo_SetAngle(&g_servos[i], deg);
+  }
+}
+
 /* USER CODE END 0 */
 
 /**
@@ -262,11 +298,10 @@ int main(void)
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_USART1_UART_Init();
-  MX_TIM2_Init();
+  MX_TIM3_Init();
   /* USER CODE BEGIN 2 */
-  LED_OFF();                                              /* 蓝灯常灭：T1 阶段不再闪烁 */
-  HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1);               /* 启动 TIM2_CH1 PWM 输出 */
-  Servo_ApplyPulse(&g_servos[0], SERVO_PULSE_MID_US);     /* 上电即中位 1.5ms，舵机不甩 */
+  LED_OFF();                                    /* 蓝灯常灭：T1 阶段不再闪烁 */
+  Servo_InitAll();                              /* 四路 PWM 全部启动，先给中位 1.5ms */
   g_servo_tick = HAL_GetTick();
   g_demo_tick  = g_servo_tick;
   T0_PrintBanner();               /* T0：开机打印自检信息（工程名/时钟/复位原因） */
@@ -296,13 +331,13 @@ int main(void)
     {
       g_demo_tick = now;
       g_demo_step = (uint8_t)((g_demo_step + 1U) % 3U);
-      Servo_SetAngle(&g_servos[0], g_demo_angle[g_demo_step]);
-      printf("[T1] 目标角度 %d deg -> 脉宽 %lu us\r\n",
+      Servo_SetAllAngle(g_demo_angle[g_demo_step]);
+      printf("[T1] 四路目标角度 %d deg -> 脉宽 %lu us\r\n",
              (int)g_demo_angle[g_demo_step],
              (unsigned long)Servo_AngleToPulse(&g_servos[0], g_demo_angle[g_demo_step]));
     }
 
-    /* USER CODE END 3 */
+  /* USER CODE END 3 */
   }
 }
 
