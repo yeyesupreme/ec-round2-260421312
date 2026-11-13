@@ -18,6 +18,7 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "tim.h"
 #include "usart.h"
 #include "gpio.h"
 
@@ -29,26 +30,48 @@
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
 
+/**
+  * @brief 一路舵机的参数与运行状态
+  * @note  把"哪路定时器 / 哪个通道 / 行程范围 / 当前与目标脉宽"打包，
+  *        扩到四路时只是数组长度不同，控制代码一行都不用改。
+  */
+typedef struct
+{
+  TIM_HandleTypeDef *htim;          /* 所属定时器句柄 */
+  uint32_t           channel;       /* 通道号：TIM_CHANNEL_x */
+  uint16_t           pulse_min;     /* 下限脉宽 µs */
+  uint16_t           pulse_max;     /* 上限脉宽 µs */
+  uint16_t           pulse_target;  /* 目标脉宽 µs */
+  uint16_t           pulse_now;     /* 当前已输出脉宽 µs */
+} Servo_t;
+
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 
-/* 引脚映射：PC13 板载蓝灯（灌电流接法，低电平点亮）；PA0 为上拉输入，接地即按下 */
+/* ---------- 工程标识 ---------- */
+#define APP_NAME            "ec-round2-260421312"   /* T0 自检打印用 */
+#define UART_TX_TIMEOUT_MS  10U                     /* 单字节发送超时，防止串口异常时卡死 */
+
+/* ---------- T1 舵机参数：所有可调量集中在此段，答辩时指这里说 ---------- */
+#define SERVO_PWM_FREQ_HZ      50U      /* 目标 50Hz → 周期 20ms（CubeMX: PSC=71, ARR=19999） */
+#define SERVO_PULSE_MIN_US     500U     /* 行程下限脉宽 */
+#define SERVO_PULSE_MAX_US     2500U    /* 行程上限脉宽 */
+#define SERVO_PULSE_MID_US     1500U    /* 中位脉宽 */
+#define SERVO_ANGLE_MIN_DEG    0.0f     /* 与 MIN_US 对应的角度 */
+#define SERVO_ANGLE_MAX_DEG    180.0f   /* 与 MAX_US 对应的角度 */
+#define SERVO_TICK_MS          20U      /* 刷新节拍，与 PWM 周期一致 */
+#define SERVO_SLEW_US_PER_TICK 25U      /* 每拍脉宽最大变化量：限速，抑制过冲与啸叫 */
+#define SERVO_DEMO_STEP_MS     1000U    /* 自测时每个位置停留时间 */
+
+/* 板载蓝灯（PC13，灌电流接法，低电平点亮）：T1 阶段只熄灭，不再参与逻辑 */
 #define LED_PORT            GPIOC
 #define LED_PIN             GPIO_PIN_13
-#define KEY_PORT            GPIOA
-#define KEY_PIN             GPIO_PIN_0
-
-#define LED_ON()            HAL_GPIO_WritePin(LED_PORT, LED_PIN, GPIO_PIN_RESET)
 #define LED_OFF()           HAL_GPIO_WritePin(LED_PORT, LED_PIN, GPIO_PIN_SET)
 
-#define APP_NAME            "ec-round2-260421312"  /* 用于 T0 自检打印的工程名 */
-
-#define KEY_DEBOUNCE_MS     20U     /* 按键消抖：电平需稳定 20ms 才认账 */
-#define LED_BLINK_HALF_MS   500U    /* 翻转半周期 500ms → 整周期 1s → 1Hz */
-
-#define UART_TX_TIMEOUT_MS  10U     /* 单字节发送超时，防止串口异常时卡死 */
+/* 当前接了几路。CubeMX 侧目前只配了 TIM2_CH1，故为 1；扩到四路时改这里并补表项 */
+#define SERVO_COUNT         1U
 
 /* USER CODE END PD */
 
@@ -60,11 +83,19 @@
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
-static uint8_t  g_blink_enable = 1U;   /* LED 闪烁使能：1=1Hz 闪烁，0=常灭（按键翻转） */
-static uint32_t g_led_tick     = 0U;   /* 上一次 LED 翻转时刻 */
-static uint32_t g_key_tick     = 0U;   /* 按键电平最后一次变化时刻 */
-static uint8_t  g_key_level    = 1U;   /* 消抖后的稳定电平：1=释放 0=按下 */
-static uint8_t  g_key_latched  = 0U;   /* 本次按下已处理，避免长按连发 */
+/* 舵机表：当前 1 路（TIM2_CH1 → PA15）。明天换 TIM3 四路时，只改这张表 */
+static Servo_t g_servos[SERVO_COUNT] =
+{
+  { &htim2, TIM_CHANNEL_1, SERVO_PULSE_MIN_US, SERVO_PULSE_MAX_US,
+    SERVO_PULSE_MID_US, SERVO_PULSE_MID_US },
+};
+
+static uint32_t g_servo_tick = 0U;   /* 上一次脉宽推进时刻 */
+static uint32_t g_demo_tick  = 0U;   /* 自测换位时刻 */
+static uint8_t  g_demo_step  = 0U;   /* 自测位置序号 */
+
+/* 自测序列：90° / 135° / 45°，按 0~180° 线性映射正好是 1500 / 2000 / 1000 µs */
+static const float g_demo_angle[3] = { 90.0f, 135.0f, 45.0f };
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -115,7 +146,92 @@ static void T0_PrintBanner(void)
   printf("================================\r\n");
 }
 
+/**
+  * @brief 把脉宽写进比较寄存器（真正输出到引脚的动作）
+  * @note  "µs 直接等于 CCR" 的原因：定时器计数频率被配成 1MHz
+  *        （72MHz / (PSC+1=72) = 1MHz），1 个计数就是 1µs，
+  *        所以 CCR = 1500 即输出 1500µs 高电平。这是"分辨率优于 1µs"的来源。
+  */
+static void Servo_ApplyPulse(Servo_t *s, uint16_t pulse_us)
+{
+  __HAL_TIM_SET_COMPARE(s->htim, s->channel, pulse_us);
+}
+
+/**
+  * @brief 角度 → 脉宽 线性映射（含角度钳位）
+  * @param deg 目标角度，超出 [0°, 180°] 时被钳位
+  * @retval 对应的脉宽 µs
+  */
+static uint16_t Servo_AngleToPulse(const Servo_t *s, float deg)
+{
+  float ratio;
+
+  if (deg < SERVO_ANGLE_MIN_DEG) deg = SERVO_ANGLE_MIN_DEG;
+  if (deg > SERVO_ANGLE_MAX_DEG) deg = SERVO_ANGLE_MAX_DEG;
+
+  ratio = (deg - SERVO_ANGLE_MIN_DEG) / (SERVO_ANGLE_MAX_DEG - SERVO_ANGLE_MIN_DEG);
+
+  /* +0.5f 是四舍五入，避免浮点截断带来最多 1µs 的系统性偏差 */
+  return (uint16_t)((float)s->pulse_min + ratio * (float)(s->pulse_max - s->pulse_min) + 0.5f);
+}
+
+/**
+  * @brief 设定目标脉宽：先钳位到行程范围，再只记录不输出
+  * @note  真正的输出由 Servo_Task() 每 20ms 推进一次，
+  *        这样大角度跳变也是"分步走过去"，不会瞬间给出阶跃指令。
+  */
+static void Servo_SetPulse(Servo_t *s, uint16_t pulse_us)
+{
+  if (pulse_us < s->pulse_min) pulse_us = s->pulse_min;
+  if (pulse_us > s->pulse_max) pulse_us = s->pulse_max;
+
+  s->pulse_target = pulse_us;
+}
+
+/**
+  * @brief 设定目标角度（内部换算成脉宽）
+  */
+static void Servo_SetAngle(Servo_t *s, float deg)
+{
+  Servo_SetPulse(s, Servo_AngleToPulse(s, deg));
+}
+
+/**
+  * @brief 每 SERVO_TICK_MS 调用一次：把当前脉宽向目标推进一步
+  * @note  限速（SLEW）有三个作用：
+  *        1) 抑制过冲——指令速度低于舵机机械最大速度，舵机始终"追得上"；
+  *        2) 减少电流冲击——四路同时大角度动作时不会把电源瞬间拉垮；
+  *        3) 降低塑料齿被猛拽的磨损。
+  */
+static void Servo_Task(void)
+{
+  uint8_t i;
+
+  for (i = 0U; i < SERVO_COUNT; i++)
+  {
+    Servo_t *s = &g_servos[i];
+
+    if (s->pulse_now < s->pulse_target)
+    {
+      uint16_t step = (uint16_t)(s->pulse_target - s->pulse_now);
+      s->pulse_now += (step > SERVO_SLEW_US_PER_TICK) ? SERVO_SLEW_US_PER_TICK : step;
+      Servo_ApplyPulse(s, s->pulse_now);
+    }
+    else if (s->pulse_now > s->pulse_target)
+    {
+      uint16_t step = (uint16_t)(s->pulse_now - s->pulse_target);
+      s->pulse_now -= (step > SERVO_SLEW_US_PER_TICK) ? SERVO_SLEW_US_PER_TICK : step;
+      Servo_ApplyPulse(s, s->pulse_now);
+    }
+    else
+    {
+      /* 已到位：不重复写寄存器，避免无意义的空转 */
+    }
+  }
+}
+
 /* USER CODE END 0 */
+
 /**
   * @brief  The application entry point.
   * @retval int
@@ -146,11 +262,15 @@ int main(void)
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_USART1_UART_Init();
+  MX_TIM2_Init();
   /* USER CODE BEGIN 2 */
+  LED_OFF();                                              /* 蓝灯常灭：T1 阶段不再闪烁 */
+  HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1);               /* 启动 TIM2_CH1 PWM 输出 */
+  Servo_ApplyPulse(&g_servos[0], SERVO_PULSE_MID_US);     /* 上电即中位 1.5ms，舵机不甩 */
+  g_servo_tick = HAL_GetTick();
+  g_demo_tick  = g_servo_tick;
   T0_PrintBanner();               /* T0：开机打印自检信息（工程名/时钟/复位原因） */
   __HAL_RCC_CLEAR_RESET_FLAGS();  /* 读完即清，保证下次复位原因不被旧标志污染 */
-  LED_ON();                       /* 上电从"亮"起，之后每 500ms 翻转 → 1Hz */
-  g_led_tick = HAL_GetTick();
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -162,45 +282,30 @@ int main(void)
 
     /* USER CODE BEGIN 3 */
 
-    uint32_t now     = HAL_GetTick();
-    uint8_t  key_raw = (HAL_GPIO_ReadPin(KEY_PORT, KEY_PIN) == GPIO_PIN_RESET) ? 0U : 1U;
+    uint32_t now = HAL_GetTick();
 
-    /* ---------- 1. 按键：20ms 消抖 + 单次触发，翻转 LED 闪烁状态 ---------- */
-    if (key_raw != g_key_level)
+    /* ---------- 1. 每 20ms 推进一次脉宽（限速，抑制过冲） ---------- */
+    if ((now - g_servo_tick) >= SERVO_TICK_MS)
     {
-      g_key_tick  = now;        /* 电平刚变化，重新开始计时 */
-      g_key_level = key_raw;
+      g_servo_tick = now;
+      Servo_Task();
     }
 
-    if ((now - g_key_tick) >= KEY_DEBOUNCE_MS)   /* 电平已稳定，判定有效 */
+    /* ---------- 2. 自测：每 1s 换一个目标位置，1.5ms → 2.0ms → 1.0ms 循环 ---------- */
+    if ((now - g_demo_tick) >= SERVO_DEMO_STEP_MS)
     {
-      if (g_key_level == 0U)                    /* 稳定按下 */
-      {
-        if (g_key_latched == 0U)
-        {
-          g_key_latched  = 1U;
-          g_blink_enable = (uint8_t)(g_blink_enable == 0U ? 1U : 0U);
-          if (g_blink_enable == 0U) LED_OFF();  /* 关闪烁立刻灭灯，不等下一拍 */
-          printf("[KEY] %s\r\n", g_blink_enable ? "LED -> 1Hz 闪烁" : "LED -> 常灭");
-        }
-      }
-      else                                      /* 稳定释放，允许下一次触发 */
-      {
-        g_key_latched = 0U;
-      }
-    }
-
-    /* ---------- 2. LED：使能时 1Hz 非阻塞翻转 ---------- */
-    if ((g_blink_enable != 0U) && ((now - g_led_tick) >= LED_BLINK_HALF_MS))
-    {
-      g_led_tick = now;
-      HAL_GPIO_TogglePin(LED_PORT, LED_PIN);
+      g_demo_tick = now;
+      g_demo_step = (uint8_t)((g_demo_step + 1U) % 3U);
+      Servo_SetAngle(&g_servos[0], g_demo_angle[g_demo_step]);
+      printf("[T1] 目标角度 %d deg -> 脉宽 %lu us\r\n",
+             (int)g_demo_angle[g_demo_step],
+             (unsigned long)Servo_AngleToPulse(&g_servos[0], g_demo_angle[g_demo_step]));
     }
 
     /* USER CODE END 3 */
   }
-  /* USER CODE END 3 */
 }
+
 /**
   * @brief System Clock Configuration
   * @retval None
